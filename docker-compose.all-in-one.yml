@@ -1,0 +1,21 @@
+services:
+  latex-all-in-one:
+    build:
+      context: .
+      dockerfile: Dockerfile.all-in-one
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./data/postgres:/var/lib/postgresql/data
+      - ./data/cache:/app/latex-on-http/cache
+    environment:
+      # SENTRY_DSN: 
+      POSTGRES_USER: latexonhttp
+      POSTGRES_PASSWORD: latexdev
+      POSTGRES_DB: latexonhttp
+      CACHE_HOST: localhost
+      KEEP_WORKSPACE_DIR_ON_ERROR: 1
+      GOOSE_DBSTRING: postgres://latexonhttp:latexdev@localhost:5432/latexonhttp
+      LOGGING_LEVEL: INFO
+      DEFAULT_COMPILE_TIMEOUT: 15
+    restart: unless-stopped
