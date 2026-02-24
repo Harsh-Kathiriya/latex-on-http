@@ -1,0 +1,18 @@
+services:
+  latexonhttp:
+    build:
+      context: ../..
+      dockerfile: container/unified/Dockerfile
+    ports:
+      - "8080:8080"
+    volumes:
+      - pgdata:/data/postgres
+    environment:
+      POSTGRES_USER: latexonhttp
+      POSTGRES_PASSWORD: latexdev
+      POSTGRES_DB: latexonhttp
+      LOGGING_LEVEL: INFO
+      DEFAULT_COMPILE_TIMEOUT: 30
+
+volumes:
+  pgdata:
