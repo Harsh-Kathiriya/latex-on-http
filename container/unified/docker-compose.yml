@@ -1,18 +1,20 @@
 services:
-  latexonhttp:
+  latex-compiler:
     build:
       context: ../..
       dockerfile: container/unified/Dockerfile
+    container_name: latex-compiler
     ports:
-      - "8080:8080"
+      - "2345:8080"
     volumes:
-      - pgdata:/data/postgres
+      - latex-pgdata:/data/postgres
     environment:
       POSTGRES_USER: latexonhttp
       POSTGRES_PASSWORD: latexdev
       POSTGRES_DB: latexonhttp
       LOGGING_LEVEL: INFO
       DEFAULT_COMPILE_TIMEOUT: 30
+    restart: unless-stopped
 
 volumes:
-  pgdata:
+  latex-pgdata:
