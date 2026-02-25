@@ -38,6 +38,7 @@ from latexonhttp.caching.resources import (
     forward_resource_to_cache,
     get_resource_from_cache,
 )
+from latexonhttp.caching.bridge import CACHE_HOST
 
 
 logger = logging.getLogger(__name__)
@@ -334,8 +335,10 @@ def compiler_latex():
                 # Don't return error - cache is optional and shouldn't block compilation
 
         # Input cache provider.
+        # Only enable cache if CACHE_HOST is configured
+        cache_provider = get_resource_from_cache if CACHE_HOST else None
         error = fetch_resources(
-            normalized_resources, on_fetched, get_from_cache=get_resource_from_cache
+            normalized_resources, on_fetched, get_from_cache=cache_provider
         )
         # TODO Update entry in db with status (if error), nb and size of
         # fetched resources, total resources size after fetched, fetch time,
