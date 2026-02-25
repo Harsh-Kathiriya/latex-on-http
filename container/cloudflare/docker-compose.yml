@@ -1,0 +1,7 @@
+services:
+  latex:
+    build:
+      context: ../..
+      dockerfile: container/cloudflare/Dockerfile
+    ports:
+      - "2345:8080"

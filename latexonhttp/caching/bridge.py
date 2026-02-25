@@ -81,7 +81,7 @@ def request_cache_process_sync(
     # https://zguide.zeromq.org/docs/chapter4/#Client-Side-Reliability-Lazy-Pirate-Pattern
     socket = get_cache_process_sync_socket()
     if not socket:
-        return False, {"error": "No cache process host defined"}
+        return True, None
     try:
         socket.send(serialize_message(message), zmq.NOBLOCK)
     except zmq.ZMQError as ze:
@@ -102,7 +102,7 @@ def request_cache_process_sync(
                 return False, {"error": "ZMQ socket timeout", "retries": retries}
             socket = get_cache_process_sync_socket()
             if not socket:
-                return False, {"error": "No cache process host defined"}
+                return True, None
             socket.send(serialize_message(message), zmq.NOBLOCK)
 
     except zmq.ZMQError as ze:
@@ -112,7 +112,7 @@ def request_cache_process_sync(
 def request_cache_process_async(message):
     socket = get_cache_process_async_socket()
     if not socket:
-        return False, {"error": "No cache process host defined"}
+        return True, None
     try:
         socket.send(serialize_message(message), zmq.NOBLOCK)
     except zmq.ZMQError as ze:
