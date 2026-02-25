@@ -19,6 +19,7 @@ interface Env {
 export class LatexContainer extends Container {
   defaultPort = 8080;
   sleepAfter = "5m";
+  pingEndpoint = "/";
 
   override onStart(): void {
     console.log("LaTeX container started");
