@@ -321,9 +321,17 @@ def compiler_latex():
             if error:
                 return error
             # Input cache forwarding.
+            # Cache failures are non-blocking - log but don't fail compilation.
             is_ok, cache_response = forward_resource_to_cache(resource, data)
             if not is_ok or cache_response:
-                return cache_response
+                # Log cache errors but continue compilation
+                if cache_response:
+                    logger.warning(
+                        "Cache forwarding failed for resource %s: %s",
+                        resource.get("build_path", "unknown"),
+                        cache_response,
+                    )
+                # Don't return error - cache is optional and shouldn't block compilation
 
         # Input cache provider.
         error = fetch_resources(

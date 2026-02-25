@@ -1,0 +1,39 @@
+# ─── Worker ────────────────────────────────────────────────────────────
+name = "latex-on-http"
+main = "src/index.ts"
+compatibility_date = "2025-04-01"
+
+# ─── Container ─────────────────────────────────────────────────────────
+# Wrangler builds the Docker image locally and pushes it to Cloudflare's
+# registry on `wrangler deploy`.
+#
+# image             → path to the Dockerfile (relative to this file)
+# image_build_context → Docker build context (relative to this file);
+#                       must be the repo root so COPY app.py / latexonhttp/ works.
+# instance_type     → "standard-1" gives 1/2 vCPU, 4 GiB RAM, 8 GB disk.
+#                     Our image is ~6.7 GB; 8 GB disk leaves ~1.3 GB for temp files,
+#                     which is sufficient for LaTeX compiles.
+# max_instances     → cap on simultaneously running containers.
+
+[[containers]]
+class_name = "LatexContainer"
+image = "../Dockerfile"
+image_build_context = "../../.."
+instance_type = "standard-1"
+max_instances = 5
+
+# ─── Durable Object binding ───────────────────────────────────────────
+# The Worker uses this binding (env.LATEX_CONTAINER) to route requests
+# to container instances.
+
+[[durable_objects.bindings]]
+name = "LATEX_CONTAINER"
+class_name = "LatexContainer"
+
+# ─── Migration ─────────────────────────────────────────────────────────
+# Required on first deploy. Creates the Durable Object storage.
+# MUST be new_sqlite_classes (not new_classes) for containers.
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["LatexContainer"]
