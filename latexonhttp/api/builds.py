@@ -7,6 +7,7 @@ Manage Latex builds / compilations.
 :copyright: (c) 2017-2019 Yoan Tournade.
 :license: AGPL, see LICENSE for more details.
 """
+import base64
 import envparse
 import logging
 import pprint
@@ -123,7 +124,11 @@ input_spec_schema = {
                 "schema": {
                     "log_files_on_failure": {
                         "type": ["boolean", "string", "integer"],
-                    }
+                    },
+                    "format": {
+                        "type": "string",
+                        "allowed": ["pdf", "json"],
+                    },
                 },
             },
             "compiler": {
@@ -257,6 +262,13 @@ def compiler_latex():
         ),
         missing=dict,
     )
+    # -options.response.format ("pdf" for backward compat, "json" for structured response)
+    glom.assign(
+        input_spec,
+        "options.response.format",
+        glom.glom(input_spec, "options.response.format", default="pdf"),
+        missing=dict,
+    )
 
     # Pre-normalized data checks.
 
@@ -373,6 +385,14 @@ def compiler_latex():
         # Response creation.
         # -------------
 
+        response_format = glom.glom(
+            input_spec, "options.response.format", default="pdf"
+        )
+        include_log_files = glom.glom(
+            input_spec, "options.response.log_files_on_failure"
+        )
+        parsed_log = latexToPdfOutput["parsed_log"]
+
         if latexToPdfOutput["status"] != "ok":
             error_compilation = latexToPdfOutput["logs"]
             return (
@@ -384,36 +404,37 @@ def compiler_latex():
                     ),
                     "duration": round(latexToPdfOutput["duration"], 2),
                     "logs": latexToPdfOutput["logs"],
+                    "parsed_log": parsed_log,
                     **(
-                        {
-                            "log_files": latexToPdfOutput["log_files"],
-                        }
-                        if glom.glom(
-                            input_spec, "options.response.log_files_on_failure"
-                        )
+                        {"log_files": latexToPdfOutput["log_files"]}
+                        if include_log_files or response_format == "json"
                         else {}
                     ),
                 },
                 400,
             )
-        # TODO Also return compilation logs here.
-        # (So return a json. Include the PDF as base64 data?)
-        # (In the long term it will be better to give a static URL to download
-        # the generated PDF. We begin to talk about caching. This requires
-        # lifecycle management. With something like a Redis.)
-        # URL to get build result: PDF output, log, etc.
-        # TODO In async / build status endpoint, returns:
-        # - Normalized inputs;
-        # - URLs for PDF output, log;
 
-        # TODO Output cache management.
+        if response_format == "json":
+            return (
+                {
+                    "status": "success",
+                    "pdf": base64.b64encode(latexToPdfOutput["pdf"]).decode(
+                        "ascii"
+                    ),
+                    "output_filename": latexToPdfOutput["output_path"],
+                    "duration": round(latexToPdfOutput["duration"], 2),
+                    "logs": latexToPdfOutput["logs"],
+                    "parsed_log": parsed_log,
+                    "log_files": latexToPdfOutput["log_files"],
+                },
+                201,
+            )
 
         return (
             latexToPdfOutput["pdf"],
             201,
             {
                 "Content-Type": "application/pdf",
-                # TODO Pass an option for returning as attachment (instead of inline, which is the default).
                 "Content-Disposition": "inline;filename={}".format(
                     latexToPdfOutput["output_path"]
                 ),

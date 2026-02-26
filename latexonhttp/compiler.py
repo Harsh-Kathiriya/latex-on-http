@@ -15,6 +15,7 @@ import logging
 import glob
 import glom
 from latexonhttp.utils.processes import kill_all_children_processes
+from latexonhttp.utils.texlogparser import parse_latex_log
 
 logger = logging.getLogger(__name__)
 # In seconds.
@@ -48,12 +49,15 @@ def run_command(directory, command, timeout=DEFAULT_COMPILE_TIMEOUT):
     # https://unix.stackexchange.com/questions/151883/limiting-processes-to-not-exceed-more-than-10-of-cpu-usage
     stdout = ""
     is_timeout = False
+    env = os.environ.copy()
+    env["max_print_line"] = "10000"
     process = subprocess.Popen(
         command,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         cwd=directory,
         universal_newlines=True,
+        env=env,
     )
     started_at = timeit.default_timer()
     # Always have a timeout to control max compilation time and in case the
@@ -190,20 +194,25 @@ def latexToPdf(compilerName, directory, main_resource, workspace_id, options={})
     for log_path in glob.glob("*.log", root_dir=directory):
         with open(os.path.join(directory, log_path), "r") as f:
             log_files[log_path] = f.read()
+
+    logs = "\n".join(
+        commandOutput["stdout"] for commandOutput in commandOutputs
+    )
+
+    # Parse the primary .log file for structured error/warning extraction.
+    # Fall back to stdout logs if no .log file exists.
+    primary_log_name = main_resource["build_path"].replace(".tex", ".log")
+    log_to_parse = log_files.get(primary_log_name, logs)
+    parsed_log = parse_latex_log(log_to_parse)
+
     return {
-        # TODO Also return each command metadatas for db.
         "status": status,
         "pdf": pdf,
         "log_files": log_files,
         "output_path": main_resource["output_path"],
         "duration": sum(commandOutput["duration"] for commandOutput in commandOutputs),
-        # TODO New endpoints for new API with structure compile steps.
-        "logs": "\n".join(
-            [
-                # TODO Display command header.
-                commandOutput["stdout"]
-                for commandOutput in commandOutputs
-            ]
-        ),
+        "logs": logs,
         "is_timeout": is_timeout,
+        "return_codes": commandsStatusCodes,
+        "parsed_log": parsed_log,
     }
