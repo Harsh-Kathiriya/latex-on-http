@@ -16,7 +16,8 @@ WORKDIR /app/latex-on-http/
 COPY app.py Makefile pyproject.toml poetry.lock /app/latex-on-http/
 COPY ./latexonhttp/ /app/latex-on-http/latexonhttp/
 
-RUN make install
+RUN pip3 install -U --break-system-packages poetry \
+    && make install
 
 EXPOSE 8080
 

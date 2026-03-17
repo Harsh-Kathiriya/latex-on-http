@@ -41,6 +41,15 @@ from latexonhttp.caching.resources import (
     get_resource_from_cache,
 )
 from latexonhttp.caching.bridge import CACHE_HOST
+from latexonhttp.workspaces.compile_cache import (
+    compute_compile_key,
+    acquire_compile_dir,
+    release_compile_dir,
+    invalidate_compile_dir,
+    persist_resource_to_compile_dir,
+    clean_stale_outputs,
+    run_eviction,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -330,67 +339,83 @@ def compiler_latex():
     # Fetching, post-fetch normalization and checks, filesystem creation.
     # -------------
 
-    workspace_id = create_workspace(normalized_resources)
-    # TODO Create entry in db, with: job id, IP and X-Forwarded-For,
-    # user-agent, size payload,
-    # compiler, payload cleaned of resources (?).
+    # Try to use a persistent compile directory so latexmk can reuse
+    # auxiliary files (.aux, .fdb_latexmk, .toc, .bbl) from prior
+    # compiles, reducing redundant LaTeX passes from ~3 to 1.
+    compile_key = compute_compile_key(
+        normalized_resources, compilerName, input_spec.get("options")
+    )
+    use_persistent, compile_dir = acquire_compile_dir(compile_key)
+
+    if use_persistent:
+        workspace_id = compile_key
+        workspace_dir = compile_dir
+        logger.info(
+            "Using persistent compile dir %s (key=%s)", compile_dir, compile_key
+        )
+    else:
+        workspace_id = create_workspace(normalized_resources)
+        workspace_dir = get_workspace_root_path(workspace_id)
+        logger.info("Using ephemeral workspace %s", workspace_id)
+
     error_in_try_block = None
-    error_compilation = None
+    error_compilation = False
 
     try:
 
         def on_fetched(resource, data):
             logger.debug("Fetched %s: %s bytes", resource["build_path"], len(data))
-            # Hash fetched inputs;
             resource["data_spec"] = process_resource_data_spec(data)
-            error = persist_resource_to_workspace(workspace_id, resource, data)
+            if use_persistent:
+                error = persist_resource_to_compile_dir(
+                    workspace_dir, resource, data
+                )
+            else:
+                error = persist_resource_to_workspace(workspace_id, resource, data)
             if error:
                 return error
-            # Input cache forwarding.
-            # Cache failures are non-blocking - log but don't fail compilation.
             is_ok, cache_response = forward_resource_to_cache(resource, data)
             if not is_ok or cache_response:
-                # Log cache errors but continue compilation
                 if cache_response:
                     logger.warning(
                         "Cache forwarding failed for resource %s: %s",
                         resource.get("build_path", "unknown"),
                         cache_response,
                     )
-                # Don't return error - cache is optional and shouldn't block compilation
 
-        # Input cache provider.
-        # Only enable cache if CACHE_HOST is configured
         cache_provider = get_resource_from_cache if CACHE_HOST else None
         error = fetch_resources(
             normalized_resources, on_fetched, get_from_cache=cache_provider
         )
-        # TODO Update entry in db with status (if error), nb and size of
-        # fetched resources, total resources size after fetched, fetch time,
-        # resources count and size from cache.
         if error:
+            if use_persistent:
+                # Partial writes may have landed; wipe so next request
+                # with this key doesn't start from inconsistent state.
+                invalidate_compile_dir(compile_key)
             return error, 400
-        # TODO
-        # - Process build global signature/hash
-        # (compiler, resource hashes, other options...)
 
         # -------------
         # Compilation.
         # -------------
 
-        # TODO Do an util to get main resource.
         main_resource = next(
             resource
             for resource in normalized_resources
             if resource["is_main_document"]
         )
+
+        # Remove only the specific compiler output files from a prior
+        # run so a failed compile can never return a stale PDF.
+        # User-supplied PDF assets (logo.pdf, etc.) are NOT deleted.
+        if use_persistent:
+            clean_stale_outputs(workspace_dir, main_resource["build_path"])
         global _active_compilations
         with _compilations_lock:
             _active_compilations += 1
         try:
             latexToPdfOutput = latexToPdf(
                 compilerName,
-                get_workspace_root_path(workspace_id),
+                workspace_dir,
                 main_resource,
                 workspace_id,
                 input_spec["options"],
@@ -398,8 +423,6 @@ def compiler_latex():
         finally:
             with _compilations_lock:
                 _active_compilations -= 1
-        # TODO Update entry in db with status, size of PDF or logs,
-        # compilation time.
 
         # -------------
         # Response creation.
@@ -414,7 +437,7 @@ def compiler_latex():
         parsed_log = latexToPdfOutput["parsed_log"]
 
         if latexToPdfOutput["status"] != "ok":
-            error_compilation = latexToPdfOutput["logs"]
+            error_compilation = True
             return (
                 {
                     "error": (
@@ -462,12 +485,6 @@ def compiler_latex():
         )
 
     except Exception as e:
-        # -------------
-        # Error management.
-        # -------------
-
-        # TODO Report error to Sentry (create a hook for custom code?).
-
         error_in_try_block = e
         logger.exception(e)
         return ({"error": "SERVER_ERROR"}, 500)
@@ -477,10 +494,14 @@ def compiler_latex():
         # Cleanup.
         # -------------
 
-        # TODO Option to let workspace on failure
-        # from env.
-        if KEEP_WORKSPACE_DIR is False and (
-            KEEP_WORKSPACE_DIR_ON_ERROR is False
-            or (error_in_try_block is None and error_compilation is None)
-        ):
-            remove_workspace(workspace_id)
+        if use_persistent:
+            if error_in_try_block is not None:
+                invalidate_compile_dir(compile_key)
+            release_compile_dir(compile_key)
+            run_eviction()
+        else:
+            if KEEP_WORKSPACE_DIR is False and (
+                KEEP_WORKSPACE_DIR_ON_ERROR is False
+                or (error_in_try_block is None and not error_compilation)
+            ):
+                remove_workspace(workspace_id)
