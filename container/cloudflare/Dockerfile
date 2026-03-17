@@ -20,4 +20,4 @@ RUN make install
 
 EXPOSE 8080
 
-CMD ["poetry", "run", "gunicorn", "--workers=2", "--threads=8", "--bind=0.0.0.0:8080", "app:app"]
+CMD ["poetry", "run", "gunicorn", "--workers=1", "--threads=16", "--bind=0.0.0.0:8080", "app:app"]

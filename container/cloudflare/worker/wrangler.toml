@@ -11,6 +11,11 @@ account_id = "47bdce30e4337b94e234ac9b31aee19f"
 [observability]
 enabled = true
 
+# ─── Cron Trigger ──────────────────────────────────────────────────────
+# Ping instance-0 every 4 minutes to keep it warm (sleepAfter is 5m).
+[triggers]
+crons = ["*/4 * * * *"]
+
 # ─── Container ─────────────────────────────────────────────────────────
 # Wrangler builds the Docker image locally and pushes it to Cloudflare's
 # registry on `wrangler deploy`.

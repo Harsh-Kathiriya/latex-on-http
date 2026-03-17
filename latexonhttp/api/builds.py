@@ -12,9 +12,10 @@ import envparse
 import logging
 import pprint
 import json
+import threading
 import glom
 import cerberus
-from flask import Blueprint, request
+from flask import Blueprint, jsonify, request
 from latexonhttp.compiler import (
     latexToPdf,
     AVAILABLE_LATEX_COMPILERS,
@@ -49,6 +50,18 @@ KEEP_WORKSPACE_DIR = envparse.env("KEEP_WORKSPACE_DIR", cast=bool, default=False
 KEEP_WORKSPACE_DIR_ON_ERROR = envparse.env(
     "KEEP_WORKSPACE_DIR_ON_ERROR", cast=bool, default=False
 )
+
+_active_compilations = 0
+_compilations_lock = threading.Lock()
+MAX_CONCURRENT_COMPILATIONS = 2
+
+
+@builds_app.route("/status", methods=["GET"])
+def container_status():
+    return jsonify({
+        "active": _active_compilations,
+        "capacity": MAX_CONCURRENT_COMPILATIONS,
+    })
 
 
 # TODO Extract the filesystem/workspace management in a module:
@@ -371,13 +384,20 @@ def compiler_latex():
             for resource in normalized_resources
             if resource["is_main_document"]
         )
-        latexToPdfOutput = latexToPdf(
-            compilerName,
-            get_workspace_root_path(workspace_id),
-            main_resource,
-            workspace_id,
-            input_spec["options"],
-        )
+        global _active_compilations
+        with _compilations_lock:
+            _active_compilations += 1
+        try:
+            latexToPdfOutput = latexToPdf(
+                compilerName,
+                get_workspace_root_path(workspace_id),
+                main_resource,
+                workspace_id,
+                input_spec["options"],
+            )
+        finally:
+            with _compilations_lock:
+                _active_compilations -= 1
         # TODO Update entry in db with status, size of PDF or logs,
         # compilation time.
 
