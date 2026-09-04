@@ -16,6 +16,14 @@ enabled = true
 [triggers]
 crons = ["*/4 * * * *"]
 
+# ─── R2 Compile Cache ─────────────────────────────────────────────────
+# Non-secret vars for the R2 bucket used as a shared compile cache.
+# AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY are stored as Worker
+# secrets (wrangler secret put) and must NOT appear here.
+[vars]
+R2_BUCKET_NAME = "latex-compile-cache"
+R2_ACCOUNT_ID = "47bdce30e4337b94e234ac9b31aee19f"
+
 # ─── Container ─────────────────────────────────────────────────────────
 # Wrangler builds the Docker image locally and pushes it to Cloudflare's
 # registry on `wrangler deploy`.

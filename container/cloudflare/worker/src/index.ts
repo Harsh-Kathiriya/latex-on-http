@@ -2,12 +2,25 @@ import { Container, getContainer } from "@cloudflare/containers";
 
 interface Env {
   LATEX_CONTAINER: DurableObjectNamespace<LatexContainer>;
+  AWS_ACCESS_KEY_ID: string;
+  AWS_SECRET_ACCESS_KEY: string;
+  R2_BUCKET_NAME: string;
+  R2_ACCOUNT_ID: string;
 }
 
-export class LatexContainer extends Container {
+export class LatexContainer extends Container<Env> {
   defaultPort = 8080;
   sleepAfter = "5m";
   pingEndpoint = "localhost/";
+
+  // Forward R2 credentials so the container can FUSE-mount the
+  // shared compile cache bucket on startup.
+  override envVars = {
+    AWS_ACCESS_KEY_ID: this.env.AWS_ACCESS_KEY_ID,
+    AWS_SECRET_ACCESS_KEY: this.env.AWS_SECRET_ACCESS_KEY,
+    R2_BUCKET_NAME: this.env.R2_BUCKET_NAME,
+    R2_ACCOUNT_ID: this.env.R2_ACCOUNT_ID,
+  };
 
   override onStart(): void {
     console.log("LaTeX container started");

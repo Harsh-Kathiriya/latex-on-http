@@ -29,11 +29,11 @@ COMPILE_CACHE_ENABLED = os.getenv("COMPILE_CACHE_ENABLED", "true").lower() in (
     "yes",
 )
 COMPILE_CACHE_DIRECTORY = os.getenv(
-    "COMPILE_CACHE_DIRECTORY", "./tmp/loh_compile_cache"
+    "COMPILE_CACHE_DIRECTORY", "/mnt/compile-cache"
 )
-COMPILE_CACHE_MAX_ENTRIES = int(os.getenv("COMPILE_CACHE_MAX_ENTRIES", "50"))
+COMPILE_CACHE_MAX_ENTRIES = int(os.getenv("COMPILE_CACHE_MAX_ENTRIES", "1000"))
 COMPILE_CACHE_MAX_AGE_SECONDS = int(
-    os.getenv("COMPILE_CACHE_MAX_AGE_SECONDS", "3600")
+    os.getenv("COMPILE_CACHE_MAX_AGE_SECONDS", "2592000")
 )
 COMPILE_CACHE_MAX_SIZE_MB = int(os.getenv("COMPILE_CACHE_MAX_SIZE_MB", "512"))
 
@@ -44,6 +44,9 @@ _EVICTION_INTERVAL_SECONDS = 60
 # protects the dict of per-key locks itself.
 _compile_locks: dict[str, threading.Lock] = {}
 _meta_lock = threading.Lock()
+
+_LOCK_FILENAME = ".compile_lock"
+_LOCK_STALE_SECONDS = 300
 
 # Track last-used timestamps in-memory for LRU eviction.
 _last_used: dict[str, float] = {}
@@ -126,6 +129,64 @@ def _get_compile_dir(compile_key: str) -> str:
     return os.path.abspath(os.path.join(COMPILE_CACHE_DIRECTORY, compile_key))
 
 
+def _lock_file_path(compile_dir: str) -> str:
+    return os.path.join(compile_dir, _LOCK_FILENAME)
+
+
+def _try_acquire_file_lock(compile_dir: str) -> bool:
+    """Create a lock file to signal cross-instance ownership.
+
+    Uses O_CREAT|O_EXCL for atomic creation.  If the file already
+    exists, checks whether it is stale (older than _LOCK_STALE_SECONDS)
+    and reclaims it — this handles the case where a container crashed
+    without releasing.
+    """
+    lock_path = _lock_file_path(compile_dir)
+    try:
+        fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        os.write(fd, str(os.getpid()).encode())
+        os.close(fd)
+        return True
+    except FileExistsError:
+        try:
+            age = time.time() - os.path.getmtime(lock_path)
+        except OSError:
+            return False
+        if age > _LOCK_STALE_SECONDS:
+            logger.info("Reclaiming stale file lock: %s (age=%.0fs)", lock_path, age)
+            try:
+                os.remove(lock_path)
+                fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                os.write(fd, str(os.getpid()).encode())
+                os.close(fd)
+                return True
+            except (OSError, FileExistsError):
+                return False
+        return False
+    except OSError:
+        return False
+
+
+def _release_file_lock(compile_dir: str) -> None:
+    """Remove the lock file so other instances can use this directory."""
+    try:
+        os.remove(_lock_file_path(compile_dir))
+    except OSError:
+        pass
+
+
+def _is_file_locked(compile_dir: str) -> bool:
+    """Check whether another instance holds the file lock."""
+    lock_path = _lock_file_path(compile_dir)
+    if not os.path.exists(lock_path):
+        return False
+    try:
+        age = time.time() - os.path.getmtime(lock_path)
+    except OSError:
+        return False
+    return age <= _LOCK_STALE_SECONDS
+
+
 def _dir_size_bytes(path: str) -> int:
     """Total size of all files in a directory tree."""
     total = 0
@@ -147,6 +208,12 @@ def acquire_compile_dir(compile_key: str) -> tuple[bool, str | None]:
     Returns (True, dir_path) if the lock was acquired, or (False, None)
     if another compilation already holds this key. The caller must call
     release_compile_dir() when done.
+
+    Two layers of locking protect the directory:
+      1. In-process threading.Lock — prevents races within this Gunicorn
+         worker (multiple threads serving concurrent requests).
+      2. Filesystem lock file (.compile_lock) — prevents races across
+         container instances sharing the same R2-backed mount.
     """
     if not COMPILE_CACHE_ENABLED:
         return False, None
@@ -159,7 +226,7 @@ def acquire_compile_dir(compile_key: str) -> tuple[bool, str | None]:
     acquired = lock.acquire(blocking=False)
     if not acquired:
         logger.info(
-            "Compile cache key %s is locked, falling back to ephemeral workspace",
+            "Compile cache key %s is thread-locked, falling back to ephemeral workspace",
             compile_key,
         )
         return False, None
@@ -167,7 +234,20 @@ def acquire_compile_dir(compile_key: str) -> tuple[bool, str | None]:
     compile_dir = _get_compile_dir(compile_key)
     os.makedirs(compile_dir, exist_ok=True)
 
+    if not _try_acquire_file_lock(compile_dir):
+        lock.release()
+        logger.info(
+            "Compile cache key %s is file-locked by another instance, "
+            "falling back to ephemeral workspace",
+            compile_key,
+        )
+        return False, None
+
     _last_used[compile_key] = time.time()
+    try:
+        os.utime(compile_dir, None)
+    except OSError:
+        pass
 
     logger.info("Acquired persistent compile dir: %s", compile_dir)
     return True, compile_dir
@@ -175,6 +255,7 @@ def acquire_compile_dir(compile_key: str) -> tuple[bool, str | None]:
 
 def release_compile_dir(compile_key: str) -> None:
     """Release the lock on a compile directory (keeping its files for reuse)."""
+    _release_file_lock(_get_compile_dir(compile_key))
     with _meta_lock:
         lock = _compile_locks.get(compile_key)
     if lock is not None:
@@ -189,11 +270,22 @@ def invalidate_compile_dir(compile_key: str) -> None:
 
     Corrupted auxiliary files can cause infinite error loops, so any
     compile failure should wipe the cached state entirely.
+
+    Safe for shared storage: only deletes if no other instance holds
+    the file lock.  The caller is expected to already hold the lock
+    (via acquire_compile_dir), so this releases it first, then deletes.
     """
     compile_dir = _get_compile_dir(compile_key)
+    _release_file_lock(compile_dir)
     if os.path.isdir(compile_dir):
-        logger.info("Invalidating compile cache dir: %s", compile_dir)
-        shutil.rmtree(compile_dir, ignore_errors=True)
+        if _is_file_locked(compile_dir):
+            logger.warning(
+                "Skipping invalidation of %s — locked by another instance",
+                compile_dir,
+            )
+        else:
+            logger.info("Invalidating compile cache dir: %s", compile_dir)
+            shutil.rmtree(compile_dir, ignore_errors=True)
     _last_used.pop(compile_key, None)
 
 
@@ -334,12 +426,13 @@ def _run_eviction_sync() -> None:
             if name not in _compile_locks:
                 _compile_locks[name] = threading.Lock()
             lock = _compile_locks[name]
-        # Acquire the lock so no compile can start using this directory
-        # between our check and the rmtree (closes the TOCTOU window).
         if not lock.acquire(blocking=False):
             continue
         try:
             dir_path = os.path.join(COMPILE_CACHE_DIRECTORY, name)
+            if _is_file_locked(dir_path):
+                logger.info("Skipping eviction of %s — file-locked by another instance", name)
+                continue
             logger.info("Evicting compile cache entry: %s", name)
             shutil.rmtree(dir_path, ignore_errors=True)
             _last_used.pop(name, None)
