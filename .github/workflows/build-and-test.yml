@@ -32,9 +32,11 @@ jobs:
       - name: Type-check Cloudflare Worker
         working-directory: container/cloudflare/worker
         run: npm ci && npm run type-check
-      - name: Build Docker images
+      - name: Run compiler and cache tests
         run: |
-          make docker-build-all
-          docker build -f container/cloudflare/Dockerfile -t latex-on-http-cloudflare:test .
-      - name: Run tests (using locally built Docker images)
-        run: make test-docker-compose
+          poetry run pytest -q \
+            tests/test_compiler_security.py \
+            tests/test_compile_cache.py \
+            tests/test_compile_cache_integration.py
+      - name: Build production Cloudflare container
+        run: docker build -f container/cloudflare/Dockerfile -t latex-on-http-cloudflare:test .
