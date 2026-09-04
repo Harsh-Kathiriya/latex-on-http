@@ -7,13 +7,14 @@ HTTP json API for compilation resources specification.
 :copyright: (c) 2020 Yoan Tournade.
 :license: AGPL, see LICENSE for more details.
 """
+
 import logging
 import pprint
 import glom
 
 logger = logging.getLogger(__name__)
 
-PAYLOAD_KEYS_TO_COPY = ["compiler", "resources", "options"]
+PAYLOAD_KEYS_TO_COPY = ["compiler", "resources", "options", "cache_scope"]
 
 
 def parse_json_resources_spec(json_payload):

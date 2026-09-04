@@ -1,0 +1,13 @@
+.git
+.github
+.pytest_cache
+.venv
+__pycache__
+*.py[cod]
+*.log
+*.pdf
+node_modules
+tmp
+tests
+container/cloudflare/worker/node_modules
+container/cloudflare/worker/test-output.pdf

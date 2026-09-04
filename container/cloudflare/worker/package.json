@@ -4,6 +4,7 @@
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
+    "type-check": "tsc --noEmit",
     "containers:list": "wrangler containers list",
     "containers:images": "wrangler containers images list"
   },

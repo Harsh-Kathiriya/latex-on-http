@@ -8,8 +8,11 @@ LaTeX Font, LuaTeX module messages, and missing references.
 
 Original: https://github.com/inakleinbottle/texoutparse
 """
+
 import re
 from collections import deque
+
+MAX_PARSED_MESSAGES = 200
 
 
 class LogFileMessage:
@@ -116,26 +119,38 @@ class LatexLogParser:
     )
 
     # pdfTeX / LuaTeX PDF backend warnings
-    pdf_warning = re.compile(
-        r"^(?:pdfTeX warning|warning \(pdf backend\)): (.*)"
-    )
+    pdf_warning = re.compile(r"^(?:pdfTeX warning|warning \(pdf backend\)): (.*)")
 
     # Missing character: "Missing character: ..."
     missing_char = re.compile(r"^Missing character: (.*)")
 
-    def __init__(self, context_lines=2):
+    def __init__(self, context_lines=2, max_messages=MAX_PARSED_MESSAGES):
         self.warnings = []
         self.errors = []
         self.badboxes = []
         self.missing_refs = []
         self.context_lines = context_lines
+        self.max_messages = max(0, max_messages)
+        self.stored_messages = 0
+        self.warning_count = 0
+        self.error_count = 0
+        self.badbox_count = 0
+        self.missing_ref_count = 0
 
     def __str__(self):
         return (
-            f"Errors: {len(self.errors)}, "
-            f"Warnings: {len(self.warnings)}, "
-            f"Badboxes: {len(self.badboxes)}"
+            f"Errors: {self.error_count}, "
+            f"Warnings: {self.warning_count}, "
+            f"Badboxes: {self.badbox_count}"
         )
+
+    def _record(self, collection, message, count_attribute):
+        setattr(self, count_attribute, getattr(self, count_attribute) + 1)
+        if self.stored_messages >= self.max_messages:
+            return None
+        collection.append(message)
+        self.stored_messages += 1
+        return message
 
     def process(self, lines):
         """
@@ -191,8 +206,7 @@ class LatexLogParser:
         else:
             message["lines"] = (match.group(5), match.group(6))
 
-        self.badboxes.append(message)
-        return message
+        return self._record(self.badboxes, message, "badbox_count")
 
     def _process_warning(self, match):
         message = LogFileMessage()
@@ -209,8 +223,7 @@ class LatexLogParser:
             message["extra"] = match.group(3)
 
         message["message"] = match.group(4)
-        self.warnings.append(message)
-        return message
+        return self._record(self.warnings, message, "warning_count")
 
     def _process_error(self, match):
         message = LogFileMessage()
@@ -231,8 +244,7 @@ class LatexLogParser:
         else:
             message["message"] = match.group(5)
 
-        self.errors.append(message)
-        return message
+        return self._record(self.errors, message, "error_count")
 
     def _process_missing_ref(self, match):
         message = LogFileMessage()
@@ -240,22 +252,19 @@ class LatexLogParser:
         message["key"] = match.group(2)
         message["page"] = match.group(3)
         message["line"] = match.group(4)
-        self.missing_refs.append(message)
-        return message
+        return self._record(self.missing_refs, message, "missing_ref_count")
 
     def _process_pdf_warning(self, match):
         message = LogFileMessage()
         message["type"] = "PDF"
         message["message"] = match.group(1)
-        self.warnings.append(message)
-        return message
+        return self._record(self.warnings, message, "warning_count")
 
     def _process_missing_char(self, match):
         message = LogFileMessage()
         message["type"] = "Missing Character"
         message["message"] = match.group(1)
-        self.warnings.append(message)
-        return message
+        return self._record(self.warnings, message, "warning_count")
 
 
 def parse_latex_log(log_text):
@@ -282,9 +291,16 @@ def parse_latex_log(log_text):
         "warnings": [m.to_dict() for m in parser.warnings],
         "badboxes": [m.to_dict() for m in parser.badboxes],
         "missing_refs": [m.to_dict() for m in parser.missing_refs],
-        "errors_count": len(parser.errors),
-        "warnings_count": len(parser.warnings),
-        "badboxes_count": len(parser.badboxes),
-        "has_errors": len(parser.errors) > 0,
-        "has_warnings": len(parser.warnings) > 0,
+        "errors_count": parser.error_count,
+        "warnings_count": parser.warning_count,
+        "badboxes_count": parser.badbox_count,
+        "has_errors": parser.error_count > 0,
+        "has_warnings": parser.warning_count > 0,
+        "truncated": parser.stored_messages
+        < (
+            parser.error_count
+            + parser.warning_count
+            + parser.badbox_count
+            + parser.missing_ref_count
+        ),
     }

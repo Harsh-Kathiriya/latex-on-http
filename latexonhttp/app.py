@@ -8,6 +8,7 @@ Here are exposed the Rest API endpoints.
 :copyright: (c) 2017-2018 Yoan Tournade.
 :license: AGPL, see LICENSE for more details.
 """
+
 import os
 import logging.config
 import sentry_sdk
@@ -35,7 +36,7 @@ logging.config.dictConfig(
         "loggers": {
             "latexonhttp": {
                 "handlers": ["console"],
-                "level": os.getenv("LOGGING_LEVEL") or "DEBUG",
+                "level": os.getenv("LOGGING_LEVEL") or "INFO",
             }
         },
     }
@@ -53,6 +54,9 @@ if os.environ.get("SENTRY_DSN"):
     )
 
 app = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = int(
+    os.getenv("MAX_CONTENT_LENGTH_BYTES", str(40 * 1024 * 1024))
+)
 app.register_blueprint(builds_app, url_prefix="/builds")
 app.register_blueprint(fonts_app, url_prefix="/fonts")
 app.register_blueprint(packages_app, url_prefix="/packages")
@@ -80,9 +84,15 @@ def hello():
         {
             "message": "Welcome to the LaTeX-On-HTTP API",
             "version": get_api_version(),
-            "source": "https://github.com/YtoTech/latex-on-http",
-            "documentation": "https://github.com/YtoTech/latex-on-http",
+            "source": "https://github.com/deepdotspace/latex-on-http",
+            "documentation": "https://github.com/deepdotspace/latex-on-http",
             "texlive_version": get_texlive_version_spec()["texlive"]["version"],
         },
         200,
     )
+
+
+@app.route("/health")
+def health():
+    """Cheap container health check used by the warm-instance cron."""
+    return {"status": "ok"}, 200

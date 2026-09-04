@@ -7,7 +7,9 @@ Fetchers for resources.
 :copyright: (c) 2019 Yoan Tournade.
 :license: AGPL, see LICENSE for more details.
 """
+
 import base64
+import binascii
 import requests
 import logging
 
@@ -27,7 +29,16 @@ def fetcher_utf8_string(resource, _get_from_cache):
 
 
 def fetcher_base64_file(resource, _get_from_cache):
-    return base64.b64decode(resource["body_source"]["raw_base64"]), None
+    try:
+        return (
+            base64.b64decode(resource["body_source"]["raw_base64"], validate=True),
+            None,
+        )
+    except (binascii.Error, ValueError, TypeError):
+        return None, {
+            "error": "INVALID_BASE64_RESOURCE",
+            "path": resource.get("build_path"),
+        }
 
 
 # TODO Make it configurable.
