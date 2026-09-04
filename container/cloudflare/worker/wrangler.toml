@@ -2,6 +2,8 @@
 name = "latex-on-http"
 main = "src/index.ts"
 compatibility_date = "2025-04-01"
+workers_dev = false
+preview_urls = false
 
 # Required when you have multiple Cloudflare accounts.
 account_id = "47bdce30e4337b94e234ac9b31aee19f"
@@ -15,6 +17,15 @@ enabled = true
 # Ping instance-0 every 4 minutes to keep it warm (sleepAfter is 5m).
 [triggers]
 crons = ["*/4 * * * *"]
+
+# ─── R2 Compile Cache ─────────────────────────────────────────────────
+# Non-secret vars for the R2 bucket used as a shared compile cache.
+# AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY are stored as Worker
+# secrets (wrangler secret put) and must NOT appear here.
+[vars]
+R2_BUCKET_NAME = "latex-compile-cache"
+R2_ACCOUNT_ID = "47bdce30e4337b94e234ac9b31aee19f"
+COMPILE_CACHE_ENABLED = "true"
 
 # ─── Container ─────────────────────────────────────────────────────────
 # Wrangler builds the Docker image locally and pushes it to Cloudflare's
@@ -32,7 +43,7 @@ class_name = "LatexContainer"
 image = "../Dockerfile"
 image_build_context = "../../.."
 instance_type = "standard-2"
-max_instances = 5
+max_instances = 1
 
 # ─── Durable Object binding ───────────────────────────────────────────
 # The Worker uses this binding (env.LATEX_CONTAINER) to route requests

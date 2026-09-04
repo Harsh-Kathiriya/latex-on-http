@@ -7,9 +7,11 @@ Manage Latex builds / compilations.
 :copyright: (c) 2017-2019 Yoan Tournade.
 :license: AGPL, see LICENSE for more details.
 """
+
 import base64
 import envparse
 import logging
+import os
 import pprint
 import json
 import threading
@@ -36,21 +38,15 @@ from latexonhttp.workspaces.filesystem import (
     get_workspace_root_path,
     persist_resource_to_workspace,
 )
-from latexonhttp.caching.resources import (
-    forward_resource_to_cache,
-    get_resource_from_cache,
-)
-from latexonhttp.caching.bridge import CACHE_HOST
 from latexonhttp.workspaces.compile_cache import (
     compute_compile_key,
-    acquire_compile_dir,
-    release_compile_dir,
-    invalidate_compile_dir,
-    persist_resource_to_compile_dir,
-    clean_stale_outputs,
+    validate_cache_scope,
+    acquire_cache_lock,
+    release_cache_lock,
+    restore_compile_state,
+    publish_compile_state,
     run_eviction,
 )
-
 
 logger = logging.getLogger(__name__)
 
@@ -62,15 +58,30 @@ KEEP_WORKSPACE_DIR_ON_ERROR = envparse.env(
 
 _active_compilations = 0
 _compilations_lock = threading.Lock()
-MAX_CONCURRENT_COMPILATIONS = 2
+# All TeX children use the same locked-down Unix account. Serial execution
+# keeps one tenant's active workspace inaccessible to every other tenant.
+MAX_CONCURRENT_COMPILATIONS = 1
+COMPILE_SLOT_WAIT_SECONDS = envparse.env(
+    "COMPILE_SLOT_WAIT_SECONDS", cast=int, default=8
+)
+MAX_RESOURCES = envparse.env("MAX_RESOURCES", cast=int, default=100)
+MAX_RESOURCE_BYTES = envparse.env(
+    "MAX_RESOURCE_BYTES", cast=int, default=10 * 1024 * 1024
+)
+MAX_TOTAL_RESOURCE_BYTES = envparse.env(
+    "MAX_TOTAL_RESOURCE_BYTES", cast=int, default=24 * 1024 * 1024
+)
+_compile_slots = threading.BoundedSemaphore(MAX_CONCURRENT_COMPILATIONS)
 
 
 @builds_app.route("/status", methods=["GET"])
 def container_status():
-    return jsonify({
-        "active": _active_compilations,
-        "capacity": MAX_CONCURRENT_COMPILATIONS,
-    })
+    return jsonify(
+        {
+            "active": _active_compilations,
+            "capacity": MAX_CONCURRENT_COMPILATIONS,
+        }
+    )
 
 
 # TODO Extract the filesystem/workspace management in a module:
@@ -108,6 +119,11 @@ class JSONInputSpecEncoderForDebug(json.JSONEncoder):
 
 input_spec_schema = {
     "compiler": {"type": "string", "allowed": AVAILABLE_LATEX_COMPILERS},
+    "cache_scope": {
+        "type": "string",
+        "regex": "^[0-9a-f]{64}$",
+        "maxlength": 64,
+    },
     "resources": {
         "type": "list",
         "required": True,
@@ -178,6 +194,25 @@ def parse_bool_str_arg(value):
     return str(value).lower() in ["true", "1", "t"]
 
 
+def is_safe_relative_resource_path(value):
+    if not isinstance(value, str) or not value or len(value) > 512:
+        return False
+    if "\0" in value or "\r" in value or "\n" in value:
+        return False
+    normalized = os.path.normpath(value.replace("\\", "/"))
+    return not (
+        normalized in (".", "..")
+        or normalized.startswith("../")
+        or normalized.startswith("/")
+    )
+
+
+def normalized_resource_path(value):
+    """Return the path identity used when a resource is written to disk."""
+
+    return os.path.normpath(value.replace("\\", "/"))
+
+
 @builds_app.route("/sync", methods=["GET", "POST"])
 def compiler_latex():
     input_spec = None
@@ -190,7 +225,6 @@ def compiler_latex():
     # Support for GET querystring requests.
     if request.method == "GET":
         input_spec_mode = "querystring"
-        logger.info(pprint.pformat(request.args.to_dict(False)))
         input_spec, error = parse_querystring_resources_spec(
             request.args.to_dict(True), request.args.to_dict(False)
         )
@@ -200,16 +234,13 @@ def compiler_latex():
     # Support for multipart/form-data requests.
     if request.content_type and "multipart/form-data" in request.content_type:
         input_spec_mode = "multipart/form-data"
-        logger.info(request.content_type)
-        logger.info(pprint.pformat(request.files))
-        logger.info(pprint.pformat(request.form))
         input_spec, error = parse_multipart_resources_spec(request.form, request.files)
         if error:
             return error, 400
 
     if not input_spec:
         input_spec_mode = "json"
-        input_spec, error = parse_json_resources_spec(request.get_json())
+        input_spec, error = parse_json_resources_spec(request.get_json(silent=True))
         if error:
             return error, 400
 
@@ -217,10 +248,11 @@ def compiler_latex():
         return {"error": "MISSING_COMPILATION_SPECIFICATION"}, 400
 
     # Payload validations.
-    logger.info(request.content_type)
-    logger.info(pprint.pformat(request.files))
-    logger.info(pprint.pformat(request.form))
-    logger.info(input_spec)
+    logger.info(
+        "Received %s compilation request (%s)",
+        input_spec_mode,
+        request.content_type or "no content type",
+    )
 
     if not input_spec_validator.validate(input_spec):
         return (
@@ -229,7 +261,6 @@ def compiler_latex():
                     "error": "INVALID_PAYLOAD_SHAPE",
                     "shape_errors": input_spec_validator.errors,
                     "input_spec_mode": input_spec_mode,
-                    "input_spec": input_spec,
                 },
                 cls=JSONInputSpecEncoderForDebug,
             ),
@@ -335,68 +366,93 @@ def compiler_latex():
     if errors:
         return errors[0], 400
 
-    # -------------
-    # Fetching, post-fetch normalization and checks, filesystem creation.
-    # -------------
+    if len(normalized_resources) > MAX_RESOURCES:
+        return {"error": "TOO_MANY_RESOURCES", "max_resources": MAX_RESOURCES}, 400
 
-    # Try to use a persistent compile directory so latexmk can reuse
-    # auxiliary files (.aux, .fdb_latexmk, .toc, .bbl) from prior
-    # compiles, reducing redundant LaTeX passes from ~3 to 1.
-    compile_key = compute_compile_key(
-        normalized_resources, compilerName, input_spec.get("options")
+    unsupported_types = sorted(
+        {
+            resource["type"]
+            for resource in normalized_resources
+            if resource["type"] not in {"utf8/string", "base64/file"}
+        }
     )
-    use_persistent, compile_dir = acquire_compile_dir(compile_key)
-
-    if use_persistent:
-        workspace_id = compile_key
-        workspace_dir = compile_dir
-        logger.info(
-            "Using persistent compile dir %s (key=%s)", compile_dir, compile_key
+    if unsupported_types:
+        return (
+            {
+                "error": "REMOTE_RESOURCES_DISABLED",
+                "unsupported_resource_types": unsupported_types,
+            },
+            400,
         )
-    else:
-        workspace_id = create_workspace(normalized_resources)
-        workspace_dir = get_workspace_root_path(workspace_id)
-        logger.info("Using ephemeral workspace %s", workspace_id)
 
+    seen_resource_paths = set()
+    for resource in normalized_resources:
+        paths = (resource.get("build_path"), resource.get("output_path"))
+        if any(
+            path is not None and not is_safe_relative_resource_path(path)
+            for path in paths
+        ):
+            return {"error": "INVALID_RESOURCE_PATH"}, 400
+        build_path = normalized_resource_path(resource["build_path"])
+        if build_path in seen_resource_paths:
+            return {"error": "DUPLICATE_RESOURCE_PATH", "path": build_path}, 400
+        seen_resource_paths.add(build_path)
+
+    cache_scope = input_spec.get("cache_scope")
+    if cache_scope is not None and not validate_cache_scope(cache_scope):
+        return {"error": "INVALID_CACHE_SCOPE"}, 400
+
+    # Every compilation gets a fresh local workspace. R2 is only a backing
+    # store for selected auxiliary files, never a place where untrusted TeX
+    # runs or submitted documents are stored.
+    workspace_id = create_workspace(normalized_resources)
+    workspace_dir = get_workspace_root_path(workspace_id)
+    compile_key = compute_compile_key(
+        normalized_resources,
+        compilerName,
+        input_spec.get("options"),
+        cache_scope=cache_scope,
+    )
+    cache_locked = acquire_cache_lock(compile_key)
+    cache_restored = False
+    compile_slot_acquired = False
     error_in_try_block = None
     error_compilation = False
 
     try:
+        if cache_locked:
+            cache_restored = restore_compile_state(compile_key, workspace_dir)
+            logger.info(
+                "Compile cache %s for key %s",
+                "restored" if cache_restored else "missed",
+                compile_key[:12],
+            )
+
+        total_resource_bytes = 0
 
         def on_fetched(resource, data):
-            logger.debug("Fetched %s: %s bytes", resource["build_path"], len(data))
+            nonlocal total_resource_bytes
+            resource_size = len(data)
+            if resource_size > MAX_RESOURCE_BYTES:
+                return {
+                    "error": "RESOURCE_TOO_LARGE",
+                    "path": resource.get("build_path"),
+                    "max_bytes": MAX_RESOURCE_BYTES,
+                }
+            total_resource_bytes += resource_size
+            if total_resource_bytes > MAX_TOTAL_RESOURCE_BYTES:
+                return {
+                    "error": "RESOURCES_TOO_LARGE",
+                    "max_total_bytes": MAX_TOTAL_RESOURCE_BYTES,
+                }
+
+            logger.debug("Fetched %s: %s bytes", resource["build_path"], resource_size)
             resource["data_spec"] = process_resource_data_spec(data)
-            if use_persistent:
-                error = persist_resource_to_compile_dir(
-                    workspace_dir, resource, data
-                )
-            else:
-                error = persist_resource_to_workspace(workspace_id, resource, data)
-            if error:
-                return error
-            is_ok, cache_response = forward_resource_to_cache(resource, data)
-            if not is_ok or cache_response:
-                if cache_response:
-                    logger.warning(
-                        "Cache forwarding failed for resource %s: %s",
-                        resource.get("build_path", "unknown"),
-                        cache_response,
-                    )
+            return persist_resource_to_workspace(workspace_id, resource, data)
 
-        cache_provider = get_resource_from_cache if CACHE_HOST else None
-        error = fetch_resources(
-            normalized_resources, on_fetched, get_from_cache=cache_provider
-        )
+        error = fetch_resources(normalized_resources, on_fetched)
         if error:
-            if use_persistent:
-                # Partial writes may have landed; wipe so next request
-                # with this key doesn't start from inconsistent state.
-                invalidate_compile_dir(compile_key)
             return error, 400
-
-        # -------------
-        # Compilation.
-        # -------------
 
         main_resource = next(
             resource
@@ -404,11 +460,15 @@ def compiler_latex():
             if resource["is_main_document"]
         )
 
-        # Remove only the specific compiler output files from a prior
-        # run so a failed compile can never return a stale PDF.
-        # User-supplied PDF assets (logo.pdf, etc.) are NOT deleted.
-        if use_persistent:
-            clean_stale_outputs(workspace_dir, main_resource["build_path"])
+        if not _compile_slots.acquire(timeout=COMPILE_SLOT_WAIT_SECONDS):
+            error_compilation = True
+            return (
+                {"error": "COMPILER_BUSY", "retry_after_seconds": 2},
+                503,
+                {"Retry-After": "2"},
+            )
+        compile_slot_acquired = True
+
         global _active_compilations
         with _compilations_lock:
             _active_compilations += 1
@@ -443,7 +503,11 @@ def compiler_latex():
                     "error": (
                         "COMPILATION_TIMEOUT"
                         if latexToPdfOutput["is_timeout"]
-                        else "COMPILATION_ERROR"
+                        else (
+                            "COMPILATION_OUTPUT_LIMIT"
+                            if latexToPdfOutput.get("is_output_limit", False)
+                            else "COMPILATION_ERROR"
+                        )
                     ),
                     "duration": round(latexToPdfOutput["duration"], 2),
                     "logs": latexToPdfOutput["logs"],
@@ -457,13 +521,20 @@ def compiler_latex():
                 400,
             )
 
+        if cache_locked:
+            submitted_paths = {
+                resource["build_path"] for resource in normalized_resources
+            }
+            if not publish_compile_state(compile_key, workspace_dir, submitted_paths):
+                logger.warning(
+                    "Unable to publish compile cache key %s", compile_key[:12]
+                )
+
         if response_format == "json":
             return (
                 {
                     "status": "success",
-                    "pdf": base64.b64encode(latexToPdfOutput["pdf"]).decode(
-                        "ascii"
-                    ),
+                    "pdf": base64.b64encode(latexToPdfOutput["pdf"]).decode("ascii"),
                     "output_filename": latexToPdfOutput["output_path"],
                     "duration": round(latexToPdfOutput["duration"], 2),
                     "logs": latexToPdfOutput["logs"],
@@ -494,14 +565,18 @@ def compiler_latex():
         # Cleanup.
         # -------------
 
-        if use_persistent:
-            if error_in_try_block is not None:
-                invalidate_compile_dir(compile_key)
-            release_compile_dir(compile_key)
+        try:
+            if cache_locked:
+                release_cache_lock(compile_key)
             run_eviction()
-        else:
             if KEEP_WORKSPACE_DIR is False and (
                 KEEP_WORKSPACE_DIR_ON_ERROR is False
                 or (error_in_try_block is None and not error_compilation)
             ):
                 remove_workspace(workspace_id)
+        finally:
+            # Keep the slot until this request's compiler-owned workspace is
+            # removed. All TeX children share one unprivileged Unix account,
+            # so overlapping workspaces would weaken tenant isolation.
+            if compile_slot_acquired:
+                _compile_slots.release()

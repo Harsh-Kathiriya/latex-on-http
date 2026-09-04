@@ -1,302 +1,110 @@
-# Cloudflare Containers Deployment Guide
+# Cloudflare deployment runbook
 
-## What are Cloudflare Containers?
+The compiler is an internal service. Production and staging API Workers both
+reach the same `latex-on-http` Worker through a `LATEX_COMPILER` service
+binding. `workers.dev` and preview URLs stay disabled.
 
-Cloudflare Containers allow you to run Docker containers on Cloudflare's global network. Unlike traditional Workers (which run JavaScript/WebAssembly), Containers let you run any application that can be containerized—like your LaTeX compilation service.
+## Before deploying
 
-**Key features:**
-- **Global deployment**: Deploy once, runs everywhere on Cloudflare's edge
-- **On-demand scaling**: Containers start automatically when requests arrive
-- **Cost-effective**: Containers sleep after inactivity (5 minutes in your config), so you only pay when running
-- **Cold starts**: Typically 2-3 seconds to start a container instance
+1. Merge the reviewed compiler, API Worker, and TexPal changes.
+2. Create a replacement R2 API key restricted to the
+   `latex-compile-cache` bucket. Keep the old key active during the rollout.
+3. Put both replacement credentials into one temporary `.env` file, then
+   configure them in a single Worker version. Do not update the pair with two
+   separate commands because a container restart between them would receive a
+   mismatched key pair.
 
-## Prerequisites
-
-Before deploying, ensure you have:
-
-1. **A Cloudflare account** (paid plan required - Containers are in public beta)
-   - Sign up at https://dash.cloudflare.com/
-   - Containers require a paid plan (not free tier)
-
-2. **Docker installed and running**
-   - **macOS**: Install [Docker Desktop](https://www.docker.com/products/docker-desktop/) or [Colima](https://github.com/abiosoft/colima)
-   - **Linux**: Install Docker via your package manager
-   - **Windows**: Install Docker Desktop
-   
-   Verify Docker is running:
-   ```bash
-   docker info
+   ```sh
+   credential_file="$(mktemp)"
+   trap 'rm -f "$credential_file"' EXIT
+   chmod 600 "$credential_file"
+   ${EDITOR:-vi} "$credential_file"
+   npx wrangler secret bulk "$credential_file"
+   rm -f "$credential_file"
+   trap - EXIT
    ```
-   If this command works, Docker is running.
 
-3. **Node.js and npm** (for Wrangler CLI)
-   - Check: `node --version` and `npm --version`
-   - Install from https://nodejs.org/ if needed
+   The file must contain exactly `AWS_ACCESS_KEY_ID=...` and
+   `AWS_SECRET_ACCESS_KEY=...`. Remove it immediately after the command.
 
-4. **Wrangler CLI** (already in your project dependencies)
-   - Will be installed via `npm install` in the worker directory
+4. Confirm Wrangler is logged into account
+   `47bdce30e4337b94e234ac9b31aee19f` and Docker is running.
+5. From `container/cloudflare/worker`, run:
 
-## Step-by-Step Deployment
+   ```sh
+   npm ci
+   npm run type-check
+   npx wrangler deploy --dry-run
+   ```
 
-### Step 1: Install Dependencies
+6. Run the Python tests from the repository root. Do not remove the Durable
+   Object migration from `wrangler.toml`; Wrangler tracks applied migrations.
 
-Navigate to the worker directory and install npm packages:
+## Zero-downtime order
 
-```bash
-cd container/cloudflare/worker
-npm install
-```
+1. Deploy the DeepSpace API Worker to staging and production with its new
+   `LATEX_COMPILER` binding while the current compiler is still reachable.
+2. Compile a small document through each API environment.
+3. From `container/cloudflare/worker`, deploy this Worker/container:
 
-This installs:
-- `wrangler` (Cloudflare CLI)
-- `@cloudflare/containers` (Container SDK)
-- TypeScript and type definitions
+   ```sh
+   npm run deploy
+   ```
 
-### Step 2: Authenticate with Cloudflare
+4. Compile a small document through staging to start the replacement
+   `instance-0`, then inspect `wrangler containers images list`, `containers
+   list`, and `containers info <ID>`. Wait until the instance reports healthy
+   and its image matches the image created by this deployment. Wrangler can
+   finish the Worker deployment before the container rollout is healthy.
+5. Compile a small document through both API environments again. Confirm the
+   replacement container mounted R2 and created/restored cache state.
+6. Add the cache lifecycle rule. The bucket is dedicated to transient compile
+   state, so the rule covers every object while preserving the existing
+   incomplete-multipart rule:
 
-Log in to your Cloudflare account using Wrangler:
+   ```sh
+   npx wrangler r2 bucket lifecycle add \
+     latex-compile-cache expire-compile-cache '' \
+     --expire-days 1 --force
+   npx wrangler r2 bucket lifecycle list latex-compile-cache
+   ```
 
-```bash
-npx wrangler login
-```
+7. Redeploy TexPal, then compile the same document twice with an edit between
+   runs. Verify both builds succeed and the second restores auxiliary state.
+8. Confirm the old direct Worker URL and preview URLs are unavailable. Inspect
+   logs, container state, and R2 objects before removing the obsolete
+   `LATEX_COMPILER_URL` secret/configuration.
+9. Revoke the old R2 key only after the new container has successfully mounted
+   the bucket. The previous deployment exposed that old key to compiler child
+   processes.
 
-This will:
-- Open your browser to Cloudflare's login page
-- Ask you to authorize Wrangler
-- Store authentication credentials locally
+## Rollback
 
-**Verify authentication:**
-```bash
-npx wrangler whoami
-```
+If cache restore or publication is the only problem, set
+`COMPILE_CACHE_ENABLED = "false"` in `worker/wrangler.toml` and redeploy the
+compiler. Compilation will continue in isolated local workspaces.
 
-This should show your Cloudflare account email and account ID.
+Rollback order matters:
 
-**Do you need `account_id` in `wrangler.toml`?**
+1. A TexPal-only rollback is safe.
+2. Before rolling back the compiler, roll back TexPal so it stops sending the
+   new project identifier. Then redeploy the previous compiler Git revision,
+   including its prior Worker configuration and container image. A Worker
+   version rollback alone does not restore container configuration or routes.
+3. Before rolling the API Worker back to its URL-based version, first restore
+   the old public compiler and verify its URL. Keep `LATEX_COMPILER_URL`
+   available until the full rollout and rollback window are complete.
 
-**It depends:**
+Do not make the hardened compiler public as a cache workaround.
 
-- **If you have ONE account**: Optional. Wrangler automatically infers your account ID from your authentication token.
-- **If you have MULTIPLE accounts**: **Required.** You must specify which account to use, otherwise Wrangler may deploy to the wrong account.
+## Useful checks
 
-**To add it:**
-```toml
-account_id = "your-account-id-here"
-```
-
-You can find your Account ID:
-- From `wrangler whoami` output (shows all accounts)
-- In Cloudflare Dashboard → Overview → Account ID (right sidebar)
-
-**Note**: If `wrangler whoami` shows multiple accounts, copy the Account ID for the account you want to deploy to and add it to `wrangler.toml`.
-
-### Step 3: Verify Docker is Running
-
-**Critical**: Docker must be running during deployment. Wrangler uses Docker to build your container image.
-
-```bash
-docker info
-```
-
-If this fails, start Docker Desktop (or Colima) and try again.
-
-### Step 4: Deploy Your Container
-
-From the `container/cloudflare/worker` directory, run:
-
-```bash
-npm run deploy
-```
-
-Or directly:
-```bash
-npx wrangler deploy
-```
-
-**What happens during deployment:**
-
-1. **Worker deployment**: Wrangler uploads your TypeScript Worker code
-2. **Docker build**: Wrangler builds your Docker image using `../Dockerfile`
-   - Builds from the repo root (as specified in `image_build_context`)
-   - This may take several minutes (your image includes TeX Live, ~6.7 GB)
-3. **Image push**: Pushes the built image to Cloudflare's Container Registry
-4. **Durable Object migration**: Creates the SQLite-backed Durable Object storage (first deploy only)
-
-**Expected output:**
-```
-✨ Compiled Worker successfully
-📦 Building container image...
-🐳 Building Docker image...
-📤 Uploading container image...
-✨ Deployed Worker successfully
-```
-
-### Step 5: Wait for Provisioning
-
-**Important**: After the first deployment, wait **5-10 minutes** for Cloudflare to provision your container infrastructure. This is longer than regular Workers because containers require more setup.
-
-### Step 6: Verify Deployment
-
-Check that your containers are deployed:
-
-```bash
-# List running container instances
+```sh
 npm run containers:list
-
-# List container images in registry
 npm run containers:images
-```
-
-You should see:
-- Your Worker deployed
-- Container image in the registry
-- Container instances ready (or stopped, waiting for requests)
-
-### Step 7: Test Your Deployment
-
-Your Worker will be available at:
-```
-https://latex-on-http.<your-subdomain>.workers.dev
-```
-
-**Test the health endpoint:**
-```bash
-curl https://latex-on-http.<your-subdomain>.workers.dev/health
-```
-
-Should return: `ok`
-
-**Test LaTeX compilation:**
-Send a POST request to your Worker endpoint with LaTeX content (your Worker will route it to a container instance).
-
-## Understanding Your Deployment
-
-### Architecture
-
-```
-HTTP Request
-    ↓
-Cloudflare Worker (TypeScript)
-    ↓
-Durable Object (manages container lifecycle)
-    ↓
-Container Instance (Docker - Gunicorn + Flask + LaTeX)
-    ↓
-Response (PDF)
-```
-
-### Container Lifecycle
-
-1. **Cold start**: First request triggers container start (~2-3 seconds)
-2. **Active**: Container handles requests, stays alive for 5 minutes after last request
-3. **Sleep**: After 5 minutes idle, container stops automatically
-4. **Warm start**: Next request starts container again (faster than cold start)
-
-### Load Balancing
-
-- Your Worker load-balances across **5 container instances** using `getRandom()`
-- Each instance runs **2 Gunicorn workers** (from Dockerfile CMD)
-- Maximum **5 containers** can run simultaneously (per `max_instances`)
-
-### Instance Configuration
-
-- **Instance type**: `standard-1`
-  - 1/2 vCPU
-  - 4 GiB RAM
-  - 8 GB disk (sufficient for your ~6.7 GB image + temp files)
-
-## Troubleshooting
-
-### "Docker daemon not running"
-
-**Solution**: Start Docker Desktop or Colima, then retry deployment.
-
-### "Authentication failed"
-
-**Solution**: Run `npx wrangler login` again.
-
-### "Build failed" or "Image too large"
-
-**Solution**: 
-- Check Docker build locally: `docker build -f container/cloudflare/Dockerfile .`
-- Verify base image exists: `docker pull yoant/latexonhttp-python:debian`
-- Check disk space: Ensure you have enough space for the ~6.7 GB image
-
-### "Container not responding"
-
-**Solution**:
-- Wait 5-10 minutes after first deployment
-- Check container logs: `npx wrangler tail`
-- Verify health endpoint: `curl https://<your-worker-url>/health`
-
-### "Migration error" on subsequent deploys
-
-**Solution**: Remove the `[[migrations]]` section from `wrangler.toml` after first successful deploy (migrations only run once).
-
-## Monitoring and Logs
-
-**View Worker logs:**
-```bash
+npx wrangler deployments list
 npx wrangler tail
 ```
 
-**View container status:**
-```bash
-npm run containers:list
-```
-
-**View container images:**
-```bash
-npm run containers:images
-```
-
-## Cost Considerations
-
-- **Pricing**: Cloudflare Containers are billed per:
-  - Container runtime (time containers are running)
-  - Storage (container images in registry)
-  - Data transfer
-  
-- **Cost optimization**: Your `sleepAfter = "5m"` setting helps minimize costs by stopping idle containers quickly.
-
-- **Check pricing**: Visit https://developers.cloudflare.com/containers/pricing/ for current rates
-
-## Next Steps
-
-1. **Custom domain**: Configure a custom domain in Cloudflare dashboard
-2. **Environment variables**: Add secrets if needed: `npx wrangler secret put <KEY>`
-3. **Monitoring**: Set up alerts in Cloudflare dashboard
-4. **Scaling**: Adjust `max_instances` if you need more throughput
-
-## Useful Commands Reference
-
-```bash
-# Deploy
-npm run deploy
-
-# Local development (requires Docker)
-npm run dev
-
-# Check deployment status
-npm run containers:list
-npm run containers:images
-
-# View logs
-npx wrangler tail
-
-# Update secrets
-npx wrangler secret put MY_SECRET
-
-# Check authentication
-npx wrangler whoami
-
-# Logout
-npx wrangler logout
-```
-
-## Additional Resources
-
-- **Official Docs**: https://developers.cloudflare.com/containers/
-- **Wrangler Docs**: https://developers.cloudflare.com/workers/wrangler/
-- **Cloudflare Dashboard**: https://dash.cloudflare.com/
-- **Support**: https://community.cloudflare.com/
+R2 expiration is asynchronous. The application refuses to restore state after
+86,400 seconds even if lifecycle deletion has not physically completed yet.

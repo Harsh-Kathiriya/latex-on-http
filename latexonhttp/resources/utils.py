@@ -7,6 +7,7 @@ Resources utils.
 :copyright: (c) 2019 Yoan Tournade.
 :license: AGPL, see LICENSE for more details.
 """
+
 import hashlib
 import sys
 
@@ -21,13 +22,13 @@ def process_resource_data_spec(data):
 
 
 def prune_resources_content_for_logging(input_spec):
+    sensitive_keys = {"content", "file", "url", "git", "tar", "cache"}
     return {
         **input_spec,
         "resources": [
             {
-                **resource,
-                "content": "content" in resource,
-                "file": "file" in resource,
+                key: (True if key in sensitive_keys else value)
+                for key, value in resource.items()
             }
             for resource in input_spec.get("resources", [])
         ],

@@ -7,6 +7,7 @@ Filesystem driver / management for build workspaces.
 :copyright: (c) 2019 Yoan Tournade.
 :license: AGPL, see LICENSE for more details.
 """
+
 import logging
 import os.path
 import shutil
@@ -21,11 +22,20 @@ WORKSPACE_DIRECTORY = "./tmp/loh_workspaces"
 
 
 def is_safe_path(basedir, path, follow_symlinks=False):
-    # https://security.openstack.org/guidelines/dg_using-file-paths.html
-    # resolves symbolic links
-    if follow_symlinks:
-        return os.path.realpath(path).startswith(basedir)
-    return os.path.abspath(path).startswith(basedir)
+    """Return whether ``path`` is contained by ``basedir``.
+
+    A raw string-prefix check treats sibling paths such as ``/tmp/job-2`` as
+    children of ``/tmp/job``.  ``commonpath`` compares actual path components
+    and therefore closes that traversal edge case.
+    """
+    normalize = os.path.realpath if follow_symlinks else os.path.abspath
+    base = normalize(basedir)
+    candidate = normalize(path)
+    try:
+        return os.path.commonpath((base, candidate)) == base
+    except ValueError:
+        # Different drives on Windows, or another malformed path combination.
+        return False
 
 
 def get_workspace_root_path(workspace_id):
@@ -55,7 +65,12 @@ def persist_resource_to_workspace(workspace_id, resource, data):
 def make_workspace(workspace_id):
     workspace_path = get_workspace_root_path(workspace_id)
     logger.info("Creating workspace directory %s", workspace_path)
-    os.makedirs(workspace_path)
+    # The root is searchable but not listable. Request workspaces remain
+    # root-only until the compiler explicitly hands the active one to the
+    # unprivileged TeX account.
+    os.makedirs(WORKSPACE_DIRECTORY, mode=0o711, exist_ok=True)
+    os.chmod(WORKSPACE_DIRECTORY, 0o711)
+    os.mkdir(workspace_path, mode=0o700)
 
 
 def delete_workspace(workspace_id):
